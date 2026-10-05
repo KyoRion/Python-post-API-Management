@@ -1,23 +1,21 @@
 from datetime import datetime
-from gettext import translation
-from http.client import HTTPException
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+from uuid import UUID
 
-from fastapi import FastAPI
-from fastapi.params import Body
-from opentelemetry.trace import Status
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, Depends, HTTPException
+from psycopg2 import IntegrityError
 from pydantic import BaseModel
-import time
-from uuid6 import uuid7
-from psycopg2.extras import Json
+from sqlalchemy.orm import Session
 from slugify import slugify
+from uuid6 import uuid7
+
+from . import models
+from .database import get_db
 
 app = FastAPI()
 
 class PostTranslationCreate(BaseModel):
-    locale: str
+    locale: Literal["en", "vi"]
     title: str
     slug: Optional[str] = None
     excerpt: Optional[str] = None
@@ -26,68 +24,71 @@ class PostTranslationCreate(BaseModel):
 class PostSeoCreate(BaseModel):
     meta_title: Optional[str] = None
     meta_description: Optional[str] = None
-    meta_media_id: Optional[str] = None
+    meta_media_id: Optional[UUID] = None
+
+    canonical_url: Optional[str] = None
+
     meta_robots_noindex: bool = False
     meta_robots_nofollow: bool = False
 
+    schema_type: Optional[str] = None
+    schema_data: Optional[dict[str, Any]] = None
+
 class PostCreate(BaseModel):
-    author_id: str
+    author_id: UUID
     type: str = "post"
     status: str = "draft"
     visibility: str = "public"
 
-    featured_media_id: Optional[str] = None
+    featured_media_id: Optional[UUID] = None
     content_intent: Optional[str] = None
     published_at: Optional[datetime] = None
 
     translation: PostTranslationCreate
     seo: PostSeoCreate
 
-while True:
-    try:
-        conn = psycopg2.connect(
-            host='localhost', 
-            database='app', 
-            user='postgres', 
-            password='secret',
-            cursor_factory=RealDictCursor
-        )
-        cursor = conn.cursor()
-        print("Database connection was successful!")
-        break
-    except Exception as error:
-        print("Database connection failed!")
-        print("Error:", error)
-        time.sleep(2)
+# Functionally
+def generate_unique_slug(
+    db: Session,
+    locale: str,
+    title: str,
+    custom_slug: str | None,
+    translation_id,
+) -> str:
+    base_slug = slugify(custom_slug or title)
 
-def get_connection():
-    return psycopg2.connect(
-            host='localhost', 
-            database='app', 
-            user='postgres', 
-            password='secret',
-            cursor_factory=RealDictCursor
+    exists = (
+        db.query(models.PostTranslation.id)
+        .filter(
+            models.PostTranslation.locale == locale,
+            models.PostTranslation.slug == base_slug
         )
+        .first()
+    )
+
+    if not exists:
+        return base_slug
+
+    suffix = str(translation_id).replace("-", "")[-8:]
+
+    return f"{base_slug}-{suffix}"
 
 @app.get("/")
 def root():
     return {"message": "Hello, World!"}
 
 @app.get("/posts")
-def get_posts():
-    conn = get_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
+def get_posts(db: Session = Depends(get_db)):
+    posts = db.query(models.Post).all()
 
-    cursor.execute("""SELECT * FROM posts""")
-    posts = cursor.fetchall()
-    
     return {"data": posts}
 
 @app.post("/posts", status_code=201)
-def create_post(post: PostCreate):
-    conn = get_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
+def create_post(
+    post: PostCreate, 
+    db: Session = Depends(get_db)
+):
+    try: 
         # ========================================
         # Generate IDs
         # ========================================
@@ -97,195 +98,136 @@ def create_post(post: PostCreate):
         seo_id = str(uuid7())
 
         # ========================================
-        # Create post
-        # ========================================
-
-        cursor.execute(
-            """
-            INSERT INTO posts (
-                id,
-                author_id,
-                type,
-                status,
-                visibility,
-                featured_media_id,
-                content_intent,
-                published_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                post_id,
-                str(post.author_id),
-                post.type,
-                post.status,
-                post.visibility,
-                str(post.featured_media_id) if post.featured_media_id else None,
-                post.content_intent,
-                post.published_at
-            )
-        )
-
-        # ========================================
-        # Generate base slug
+        # Generate slug
         # ========================================
 
         base_slug = slugify(
             post.translation.slug
-            if getattr(post.translation, "slug", None)
-            else post.translation.title
+            or post.translation.title
         )
 
-        slug_translation = base_slug
+        existing_slug = (
+            db.query(models.PostTranslation.id)
+            .filter(
+                models.PostTranslation.locale
+                == post.translation.locale,
 
-        # ========================================
-        # Create translation
-        # ========================================
-
-        cursor.execute(
-            """
-            INSERT INTO post_translations (
-                id,
-                post_id,
-                locale,
-                title,
-                slug,
-                excerpt,
-                content
+                models.PostTranslation.slug
+                == base_slug
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (locale, slug) DO NOTHING
-            RETURNING id
-            """,
-            (
-                translation_id,
-                post_id,
-                post.translation.locale,
-                post.translation.title,
-                slug_translation,
-                post.translation.excerpt,
-                Json(post.translation.content),
-            )
+            .first()
         )
 
-        translation = cursor.fetchone()
+        slug_translation = (
+            f"{base_slug}-{str(translation_id).replace('-', '')[-8:]}"
+            if existing_slug
+            else base_slug
+        )
 
         # ========================================
-        # Duplicate slug
+        # Create Post
         # ========================================
 
-        if translation is None:
-            slug_translation = (
-                f"{base_slug}-{translation_id[-8:]}"
-            )
+        db_post = models.Post(
+            id=post_id,
+            author_id=post.author_id,
+            type=post.type,
+            status=post.status,
+            visibility=post.visibility,
+            featured_media_id=post.featured_media_id,
+            content_intent=post.content_intent,
+            published_at=post.published_at,
+        )
 
-            cursor.execute(
-                """
-                INSERT INTO post_translations (
-                    id,
-                    post_id,
-                    locale,
-                    title,
-                    slug,
-                    excerpt,
-                    content
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    translation_id,
-                    post_id,
-                    post.translation.locale,
-                    post.translation.title,
-                    slug_translation,
-                    post.translation.excerpt,
-                    Json(post.translation.content),
-                )
-            )
+        # ========================================
+        # Create Translation
+        # ========================================
+
+        db_translation = models.PostTranslation(
+            id=translation_id,
+            post_id=post_id,
+            locale=post.translation.locale,
+            title=post.translation.title,
+            slug=slug_translation,
+            excerpt=post.translation.excerpt,
+            content=post.translation.content,
+        )
 
         # ========================================
         # Create SEO
         # ========================================
 
-        cursor.execute(
-            """
-            INSERT INTO post_seo (
-                id,
-                post_id,
-                locale,
-                meta_title,
-                og_title,
-                twitter_title,
-                meta_description,
-                og_description,
-                twitter_description,
-                og_media_id,
-                twitter_media_id,
-                robots_index,
-                robots_follow
-            )
-            VALUES (
-                %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s
-            )
-            """,
-            (
-                seo_id,
-                post_id,
-                post.translation.locale,
+        db_seo = models.PostSEO(
+            id=seo_id,
+            post_id=post_id,
+            locale=post.translation.locale,
 
-                post.seo.meta_title,
-                post.seo.meta_title,
-                post.seo.meta_title,
+            # Standard SEO
+            meta_title=post.seo.meta_title,
+            meta_description=post.seo.meta_description,
+            canonical_url=post.seo.canonical_url,
 
-                post.seo.meta_description,
-                post.seo.meta_description,
-                post.seo.meta_description,
+            # Open Graph
+            og_title=post.seo.meta_title,
+            og_description=post.seo.meta_description,
+            og_media_id=post.seo.meta_media_id,
 
-                (
-                    str(post.seo.meta_media_id)
-                    if post.seo.meta_media_id
-                    else None
-                ),
-                (
-                    str(post.seo.meta_media_id)
-                    if post.seo.meta_media_id
-                    else None
-                ),
+            # Twitter / X
+            twitter_title=post.seo.meta_title,
+            twitter_description=post.seo.meta_description,
+            twitter_media_id=post.seo.meta_media_id,
 
-                not post.seo.meta_robots_noindex,
-                not post.seo.meta_robots_nofollow,
-            )
+            # Robots
+            robots_index=not post.seo.meta_robots_noindex,
+            robots_follow=not post.seo.meta_robots_nofollow,
+
+            # Structured data
+            schema_type=post.seo.schema_type,
+            schema_data=post.seo.schema_data,
         )
 
         # ========================================
-        # Commit transaction
+        # Commit all 3 tables
         # ========================================
 
-        conn.commit()
+        db.add_all([
+            db_post,
+            db_translation,
+            db_seo,
+        ])
+
+        db.commit()
 
         return {
             "message": "Post created successfully",
             "data": {
-                "post_id": post_id,
-                "translation_id": translation_id,
-                "seo_id": seo_id,
-                "slug": slug_translation
+                "post_id": str(post_id),
+                "translation_id": str(translation_id),
+                "seo_id": str(seo_id),
+                "slug": slug_translation,
             }
         }
 
+    except IntegrityError as e:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Post conflicts with existing data",
+                "error": str(e.orig),
+            }
+        )
+
     except Exception as e:
-        conn.rollback()
+        db.rollback()
 
         raise HTTPException(
             status_code=500,
             detail={
                 "message": "Failed to create post",
                 "error": str(e),
-                "type": type(e).__name__
+                "type": type(e).__name__,
             }
         )
 
-    finally:
-        cursor.close()
-        conn.close()
